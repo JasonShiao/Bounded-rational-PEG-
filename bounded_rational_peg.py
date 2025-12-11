@@ -3,10 +3,12 @@ import math
 import numpy as np
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
+from functools import lru_cache   # <<< MOD: added for transition caching
 
 # Parameters
 @dataclass
 class GameParams:
+    h: float  # grid size for discretization
     evader_init_pos: tuple  # (x, y)
     pursuer_init_pos: tuple  # (x, y)
     evader_speed: float
@@ -22,11 +24,13 @@ class GameParams:
 
 class PursuitEvasionGame:
     def __init__(self, params: GameParams):
+        self.h = params.h
         self.capture_radius = params.capture_radius
         self.action_space = params.action_space
         self.sigma_w = params.sigma_w # wind noise std dev
-        self.grid = params.game_grid
+        self.grid: np.ndarray = params.game_grid
         self.v = [params.pursuer_speed, params.evader_speed]
+
         # use grid size to determine state space
         H, W = self.grid.shape
         self.position_space = [(x, y) for x in range(W) for y in range(H)]
@@ -37,16 +41,45 @@ class PursuitEvasionGame:
         self.state = np.array(
             [params.pursuer_init_pos[0], params.pursuer_init_pos[1],
              params.evader_init_pos[0],  params.evader_init_pos[1]],
-            dtype=float
+            dtype=int
         )
-        self.non_terminal_states = self.get_non_terminal_states(
-            self.state_space, self.grid, self.capture_radius
-        )
+
+        # <<< MOD: precompute R and terminal map as dicts (you already had this)
+        self.R = {
+            s: self.reward_function(s, self.grid, self.capture_radius)
+            for s in self.state_space
+        }
+        self.is_terminal_map = {
+            s: self.is_terminal(s, self.grid, self.capture_radius)
+            for s in self.state_space
+        }
+        self.non_terminal_states = [
+            s for s in self.state_space if not self.is_terminal_map[s]
+        ]
+        # <<< END MOD
+
         print(f"Total states: {len(self.state_space)}, Non-terminal states: {len(self.non_terminal_states)}")
+
         # TODO: generate wind_map
-        self.wind_map = {s: (0.1, 0.1) for s in self.position_space} # for each position (x,y), return (wx, wy)
-        # precompute k-level policies
-        
+        self.wind_map = {s: (0.0, 0.0) for s in self.position_space} # for each position (x,y), return (wx, wy)
+
+        # <<< MOD: build index mappings and NumPy versions of R and terminal mask
+        self.num_states = len(self.state_space)
+        self.state_to_idx = {s: i for i, s in enumerate(self.state_space)}
+        self.idx_to_state = list(self.state_space)
+
+        self.R_array = np.zeros(self.num_states, dtype=float)
+        self.is_terminal_array = np.zeros(self.num_states, dtype=bool)
+        for i, s in enumerate(self.idx_to_state):
+            self.R_array[i] = self.R[s]
+            self.is_terminal_array[i] = self.is_terminal_map[s]
+
+        self.non_terminal_indices = np.where(~self.is_terminal_array)[0]
+    
+    def random_init_state(self):
+        # randomly select a non-terminal state for initialization
+        idx = np.random.choice(len(self.non_terminal_states))
+        self.state = np.array(self.non_terminal_states[idx], dtype=int)
     
     def step(self, pursuer_action, evader_action):
         pass
@@ -63,6 +96,10 @@ class PursuitEvasionGame:
         plt.imshow(img)
         plt.scatter(self.state[0], self.state[1], c='blue', label='Pursuer')
         plt.scatter(self.state[2], self.state[3], c='green', label='Evader')
+        
+        plt.gca().invert_yaxis()  # <<< flip y-axis to match your internal coordinates
+        plt.gca().set_aspect("equal")
+
         plt.legend()
         plt.show()
         
@@ -159,7 +196,7 @@ class PursuitEvasionGame:
                 max_val = norm_b
         return h * max_val + 4*sigma_w**2
 
-    def state_transition(self, state, joint_action, h, sigma_w):
+    def state_transition(self, state, joint_action, sigma_w):
         state = np.array(state, dtype=int)
         # TODO: Check this is correct
         # P_h(s_h'| s_h, theta)
@@ -167,7 +204,7 @@ class PursuitEvasionGame:
         sigma2 = sigma_w ** 2
         # b_vect represent the drift velocity (agent vel + wind speed)
         b_vec = self.b_vec(state, joint_action, self.wind_map, self.v)  # length 4
-        Q = self.Q_h(state, h, sigma_w)
+        Q = self.Q_h(state, self.h, sigma_w)
 
         probs = {}
         total = 0.0
@@ -182,13 +219,13 @@ class PursuitEvasionGame:
 
             # s_h + h e_j -> grid index (grid size h) s_h + e_j
             s_plus = tuple(state + e_j)
-            p_plus = (sigma2 / 2.0 + h * b_plus) / Q
+            p_plus = (sigma2 / 2.0 + self.h * b_plus) / Q
             probs[s_plus] = probs.get(s_plus, 0.0) + p_plus
             total += p_plus
 
             # s_h - h e_j
             s_minus = tuple(state - e_j)
-            p_minus = (sigma2 / 2.0 + h * b_minus) / Q
+            p_minus = (sigma2 / 2.0 + self.h * b_minus) / Q
             probs[s_minus] = probs.get(s_minus, 0.0) + p_minus
             total += p_minus
 
@@ -215,8 +252,7 @@ class PursuitEvasionGame:
             return -1
         else: # both not crash
             # captured or evaded
-            distance = np.linalg.norm(np.array(pursuer_pos) - np.array(evader_pos))
-            if distance <= capture_radius: # captured
+            if self.is_captured(state):
                 return 1
             elif self.is_in_region_E(evader_pos, game_grid):
                 return -1
@@ -243,6 +279,12 @@ class PursuitEvasionGame:
         if x < 0 or x >= W or y < 0 or y >= H:
             return False
         return game_grid[y, x] == 2  # evader region E
+    
+    def is_captured(self, state):
+        pursuer_pos = (state[0], state[1])
+        evader_pos = (state[2], state[3])
+        distance = np.linalg.norm(np.array(pursuer_pos) - np.array(evader_pos))
+        return distance <= self.capture_radius
 
     def is_terminal(self, state, game_grid: np.ndarray, capture_radius):
         pursuer_pos = (state[0], state[1])
@@ -253,8 +295,7 @@ class PursuitEvasionGame:
             return True
         
         # Check for capture
-        distance = np.linalg.norm(np.array(pursuer_pos) - np.array(evader_pos))
-        if distance <= capture_radius:
+        if self.is_captured(state):
             return True
         
         # Check for evader reaching region E
@@ -309,21 +350,33 @@ class PursuitEvasionGame:
         opponent_policy,    # dict: state -> {a_opp_idx: prob}
         opt_type,           # 'MAX' for pursuer, 'MIN' for evader
         grid,
-        epsilon=1e-5,
-        max_iter=30,
+        epsilon=1e-3,
+        max_iter=20,
+        gamma=1.0,
     ):
         n_actions = len(self.action_space)
 
-        # 1. Init V(s): terminal states get G_h(s) = reward_function(s),
-        #               non-terminals start from 0.
-        V = {}
-        for s in self.state_space:
-            Gh = self.reward_function(s, grid, self.capture_radius)  # ±1 or 0
-            V[s] = Gh
+        # --- Build opponent policy as NumPy array [num_states, n_actions] ---
+        # <<< MOD
+        opponent_pi_array = np.zeros((self.num_states, n_actions), dtype=float)
+        for s, a_dict in opponent_policy.items():
+            i_s = self.state_to_idx[s]
+            for a_idx, p in a_dict.items():
+                opponent_pi_array[i_s, a_idx] = p
+        # <<< END MOD
 
-        # Init policy: we’ll overwrite for non-terminal states
-        policy = {s: {a_idx: 0.0 for a_idx in range(n_actions)}
-                  for s in self.non_terminal_states}
+        # --- INIT VALUE FUNCTION as arrays: terminals = R, non-terminals = 0 ---
+        # <<< MOD
+        V_old = np.zeros(self.num_states, dtype=float)
+        V_old[self.is_terminal_array] = self.R_array[self.is_terminal_array]
+        V_new = V_old.copy()
+        # <<< END MOD
+
+        # Init policy as dict, unchanged (states -> action distributions)
+        policy = {
+            s: {a_idx: 0.0 for a_idx in range(n_actions)}
+            for s in self.non_terminal_states
+        }
 
         # Choose extremum type
         if opt_type == "MAX":        # pursuer
@@ -333,58 +386,58 @@ class PursuitEvasionGame:
             better = lambda val, best: val < best
             init_best = float("inf")
 
+        # Cache transitions P_h(s' | s, a_p, a_e)
+        @lru_cache(maxsize=None)
+        def get_transition(s, a_p_idx, a_e_idx):
+            joint_action = (
+                self.action_space[a_p_idx],
+                self.action_space[a_e_idx],
+            )
+            return self.state_transition(
+                s,
+                joint_action,
+                sigma_w=self.sigma_w,
+            )
+
         # 2. Value iteration loop over m
         for it in range(max_iter):
+            #self.plot_value_slice_pursuer(V_old, evader_pos=(5,5), title=f"Value function at iteration {it+1}")
+            #self.plot_value_slice_evader(V_old, pursuer_pos=(5,5), title=f"Value function at iteration {it+1}")
             print(f"  Value iteration it={it+1}...")
-            V_old = V.copy()
             delta = 0.0
 
-            # Loop over all non-terminal states s ∈ S_h^o
-            for s in self.non_terminal_states:
-                print(f"    Processing state {s}...")
-                # opponent policy can be state-dependent: π^{-i}(·|s)
-                # if you’re using a single stationary policy, opponent_policy
-                # can itself just be {a_opp_idx: prob}, and you can set:
-                # opp_pi = opponent_policy
-                opp_pi = opponent_policy[s]
+            # Loop over all non-terminal states using indices
+            for i_s in self.non_terminal_indices:
+                s = self.idx_to_state[i_s]           # state tuple
+                opp_pi_row = opponent_pi_array[i_s]  # shape (n_actions,)
 
                 best_value = init_best
                 best_actions = []
 
                 # Loop over agent's own actions (indexed)
                 for a_i in range(n_actions):
-                    #print(f"      Evaluating action {a_i}...\n")
                     expected_value = 0.0
 
                     # Marginalize over opponent actions θ^{-i}
-                    for a_opp_i, p_opp in opp_pi.items():
-                        #print(f"        Opponent action {a_opp_i} with prob {p_opp:.4f}...\n")
-                        # Order of actions in the joint action:
-                        # MAX (pursuer):   (a_self, a_opp) = (a_p, a_e)
-                        # MIN (evader):    (a_self, a_opp) = (a_e, a_p)
+                    for a_opp_i, p_opp in enumerate(opp_pi_row):
+                        if p_opp == 0.0:
+                            continue
+
                         if opt_type == "MAX":
                             a_p_idx, a_e_idx = a_i, a_opp_i
                         else:
                             a_p_idx, a_e_idx = a_opp_i, a_i
 
-                        joint_action = (
-                            self.action_space[a_p_idx],
-                            self.action_space[a_e_idx],
-                        )
+                        # use cached transition
+                        next_state_probs = get_transition(s, a_p_idx, a_e_idx)
 
-                        # P_h(s' | s, θ) from your cMDP construction
-                        #print(f"        Computing state transition for joint action {joint_action}...\n")
-                        next_state_probs = self.state_transition(
-                            s,
-                            joint_action,
-                            h=1.0,
-                            sigma_w=self.sigma_w,
-                        )
-                        
-                        #print(f"        Next state probabilities: {next_state_probs}\n")
-                        # Bellman backup: sum_{s'} P(s'|s,a) V_old(s')
+                        # Bellman backup with reward + discount
                         for s_next, p_s in next_state_probs.items():
-                            expected_value += p_opp * p_s * V_old[s_next]
+                            j = self.state_to_idx[s_next]  # successor index
+                            if self.is_terminal_array[j]:
+                                expected_value += p_opp * p_s * V_old[j]  # = R(s')
+                            else:
+                                expected_value += p_opp * p_s * (gamma * V_old[j])
 
                     # extremum over actions
                     if better(expected_value, best_value):
@@ -393,23 +446,30 @@ class PursuitEvasionGame:
                     elif np.isclose(expected_value, best_value, atol=1e-10):
                         best_actions.append(a_i)
 
-                # Update V_{m+1}(s)
-                V[s] = best_value
-                delta = max(delta, abs(best_value - V_old[s]))
+                # Update V_{m+1}(s_i)
+                V_new[i_s] = best_value
+                delta = max(delta, abs(V_new[i_s] - V_old[i_s]))
 
-                # 4. Extract greedy policy π^i,(k)(·|s): uniform over best_actions
+                # Extract greedy policy π^i,(k)(·|s): uniform over best_actions
                 prob_br = 1.0 / len(best_actions)
-                policy[s] = {
+                s_tuple = self.idx_to_state[i_s]
+                policy[s_tuple] = {
                     a_idx: (prob_br if a_idx in best_actions else 0.0)
                     for a_idx in range(n_actions)
                 }
 
+            # swap buffers
+            V_old, V_new = V_new, V_old
+
+            print(f"    delta = {delta:.3e}")
             if delta < epsilon:
-                # print(f"Converged after {it+1} iterations, delta={delta:.2e}")
+                print(f"Converged after {it+1} iterations.")
                 break
 
-        # print(f"Value iteration ended in {it+1} iterations. Final delta={delta:.2e}")
-        return policy, V
+        # return the final V as a dict too (if you want), or as an array
+        V_final = {s: V_old[self.state_to_idx[s]] for s in self.state_space}
+        return policy, V_final
+
 
     # =================== Oppoent Level Inferring ====================== #
     # Level inferring algorithm
@@ -430,7 +490,6 @@ class PursuitEvasionGame:
                 )
                 trans = self.state_transition(
                     s, joint_action,
-                    h=1.0,
                     sigma_w=self.sigma_w
                 )
                 prob += p_i * p_o * trans.get(s_next, 0.0)
@@ -487,3 +546,99 @@ class PursuitEvasionGame:
         Implements k_{N+1}^i = min{ \hat{k}_N^{-i} + 1, k_max^i }.
         """
         return min(estimated_opp_level + 1, my_level_max)
+
+
+    # =================== Debug Helpers ====================== #
+    def plot_value_slice_pursuer(self, V_array, evader_pos, title=None, clim=None):
+        """
+        Plot V(x1, y1, x2*, y2*) as a heatmap over pursuer positions (x1,y1),
+        fixing the evader position to evader_pos = (x2*, y2*).
+
+        V_array: 1D np.array of shape (num_states,), indexed by self.state_to_idx.
+        """
+        H, W = self.grid.shape
+        x2_fixed, y2_fixed = evader_pos
+
+        V_map = np.full((H, W), np.nan, dtype=float)
+
+        for y1 in range(H):
+            for x1 in range(W):
+                s = (x1, y1, x2_fixed, y2_fixed)
+                s_idx = self.state_to_idx.get(s, None)
+                if s_idx is None:
+                    continue
+
+                V_map[y1, x1] = V_array[s_idx]
+
+        plt.figure(figsize=(6, 5))
+        if clim is not None:
+            im = plt.imshow(V_map, origin="lower", cmap="coolwarm",
+                            vmin=clim[0], vmax=clim[1])
+        else:
+            im = plt.imshow(V_map, origin="lower", cmap="coolwarm")
+
+        plt.colorbar(im, label="Value V(s)")
+        plt.title(title or f"Value for pursuer (evader at {evader_pos})")
+
+        # overlay the game grid (obstacles, E region)
+        obs_y, obs_x = np.where(self.grid == 1)
+        E_y,   E_x   = np.where(self.grid == 2)
+        plt.scatter(obs_x, obs_y, marker='s', s=30, c='black', label="Obstacle")
+        plt.scatter(E_x, E_y, marker='s', s=30, c='red',   label="Region E")
+
+        # mark evader fixed position
+        plt.scatter([x2_fixed], [y2_fixed], c='green', s=80, edgecolor='k', label="Evader fixed")
+
+        plt.xlabel("x1 (pursuer)")
+        plt.ylabel("y1 (pursuer)")
+        plt.gca().set_aspect("equal")
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.show()
+        
+    def plot_value_slice_evader(self, V_array, pursuer_pos, title=None, clim=None):
+        """
+        Plot V(x1*, y1*, x2, y2) as a heatmap over evader positions (x2,y2),
+        fixing the pursuer position to pursuer_pos = (x1*, y1*).
+
+        V_array: 1D np.array of shape (num_states,), indexed by self.state_to_idx.
+        """
+        H, W = self.grid.shape
+        x1_fixed, y1_fixed = pursuer_pos
+
+        V_map = np.full((H, W), np.nan, dtype=float)
+
+        for y2 in range(H):
+            for x2 in range(W):
+                s = (x1_fixed, y1_fixed, x2, y2)
+                s_idx = self.state_to_idx.get(s, None)
+                if s_idx is None:
+                    continue
+
+                V_map[y2, x2] = V_array[s_idx]
+
+        plt.figure(figsize=(6, 5))
+        if clim is not None:
+            im = plt.imshow(V_map, origin="lower", cmap="coolwarm",
+                            vmin=clim[0], vmax=clim[1])
+        else:
+            im = plt.imshow(V_map, origin="lower", cmap="coolwarm")
+
+        plt.colorbar(im, label="Value V(s)")
+        plt.title(title or f"Value for evader (pursuer at {pursuer_pos})")
+
+        # overlay the game grid (obstacles, E region)
+        obs_y, obs_x = np.where(self.grid == 1)
+        E_y,   E_x   = np.where(self.grid == 2)
+        plt.scatter(obs_x, obs_y, marker='s', s=30, c='black', label="Obstacle")
+        plt.scatter(E_x, E_y, marker='s', s=30, c='red',   label="Region E")
+
+        # mark pursuer fixed position
+        plt.scatter([x1_fixed], [y1_fixed], c='blue', s=80, edgecolor='k', label="Pursuer fixed")
+
+        plt.xlabel("x2 (evader)")
+        plt.ylabel("y2 (evader)")
+        plt.gca().set_aspect("equal")
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.show()
