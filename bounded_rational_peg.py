@@ -42,6 +42,7 @@ class PursuitEvasionGame:
         self.non_terminal_states = self.get_non_terminal_states(
             self.state_space, self.grid, self.capture_radius
         )
+        print(f"Total states: {len(self.state_space)}, Non-terminal states: {len(self.non_terminal_states)}")
         # TODO: generate wind_map
         self.wind_map = {s: (0.1, 0.1) for s in self.position_space} # for each position (x,y), return (wx, wy)
         # precompute k-level policies
@@ -65,15 +66,84 @@ class PursuitEvasionGame:
         plt.legend()
         plt.show()
         
+    def plot_trajectory(self, trajectory, title="Pursuit–Evader Trajectory"):
+        """
+        trajectory: list of states [(x1,y1,x2,y2), ...]
+                    where state[t] corresponds to time t.
+        """
+        H, W = self.grid.shape
+
+        # -------------------------
+        # Background grid
+        # -------------------------
+        img = np.zeros((H, W, 3), dtype=np.uint8)
+        img[self.grid == 0] = [255, 255, 255]  # free = white
+        img[self.grid == 1] = [0,   0,   0]    # obstacle = black
+        img[self.grid == 2] = [255, 0,   0]    # evader region E = red
+
+        plt.figure(figsize=(6, 6))
+        plt.imshow(img)
+        plt.title(title)
+
+        # -------------------------
+        # Extract pursuer / evader paths
+        # -------------------------
+        px = [s[0] for s in trajectory]  # pursuer x
+        py = [s[1] for s in trajectory]  # pursuer y
+        ex = [s[2] for s in trajectory]  # evader x
+        ey = [s[3] for s in trajectory]  # evader y
+
+        # -------------------------
+        # Plot trajectories
+        # -------------------------
+        plt.plot(px, py, '-o', color='blue', markersize=3, label="Pursuer path")
+        plt.plot(ex, ey, '-o', color='green', markersize=3, label="Evader path")
+
+        # -------------------------
+        # arrows to show direction
+        # -------------------------
+        def plot_arrows(xs, ys, color):
+            for i in range(len(xs) - 1):
+                dx = xs[i+1] - xs[i]
+                dy = ys[i+1] - ys[i]
+                plt.arrow(xs[i], ys[i], dx*0.8, dy*0.8,
+                          head_width=0.3, head_length=0.3,
+                          color=color, length_includes_head=True)
+
+        plot_arrows(px, py, 'blue')
+        plot_arrows(ex, ey, 'green')
+
+        # -------------------------
+        # Mark start + end
+        # -------------------------
+        plt.scatter(px[0], py[0], s=80, c='cyan', edgecolor='black', label="Pursuer start")
+        plt.scatter(ex[0], ey[0], s=80, c='lime', edgecolor='black', label="Evader start")
+
+        plt.scatter(px[-1], py[-1], s=80, c='navy', edgecolor='yellow', label="Pursuer end")
+        plt.scatter(ex[-1], ey[-1], s=80, c='darkgreen', edgecolor='yellow', label="Evader end")
+
+        plt.legend(loc='lower right')
+        plt.gca().invert_yaxis()       # because image coordinates start top-left
+        plt.grid(False)
+        plt.show()
+        
     def b_vec(self, state, joint_action, wind_map, v):
         # Drift vector b for each state_entry
         # v: [v1, v2] # speed of evader and pursuer
-        w = [ wind_map((state[0], state[1])), wind_map((state[2], state[3])) ] # wind at pursuer pos
+        x1, y1, x2, y2 = state
+        p1 = (x1, y1)
+        p2 = (x2, y2)
+
+        w_p1 = wind_map[p1]  # (wx1, wy1)
+        w_p2 = wind_map[p2]  # (wx2, wy2)
+
+        w = [w_p1, w_p2]
         # w: [wx1(p1), wy1(p1), wx2(p2), wy2(p2)] # mean wind speed at positions of p1 and p2
         b_vec = np.zeros(4)
         for i in range(2):
-            b_vec[2*i+0] = v[i] * np.cos(joint_action[i]) + w[i][0]
-            b_vec[2*i+1] = v[i] * np.sin(joint_action[i]) + w[i][1]
+            theta = joint_action[i]
+            b_vec[2*i + 0] = v[i] * np.cos(theta) + w[i][0]
+            b_vec[2*i + 1] = v[i] * np.sin(theta) + w[i][1]
 
         return b_vec
 
@@ -90,6 +160,7 @@ class PursuitEvasionGame:
         return h * max_val + 4*sigma_w**2
 
     def state_transition(self, state, joint_action, h, sigma_w):
+        state = np.array(state, dtype=int)
         # TODO: Check this is correct
         # P_h(s_h'| s_h, theta)
         # ret: dict mapping s_h' to probability
@@ -103,20 +174,20 @@ class PursuitEvasionGame:
 
         for j in range(4):
             e_j = np.zeros(4)
-            e_j[j] = 1.0
+            e_j[j] = 1
 
             b_j = b_vec[j]
             b_plus = max(b_j, 0.0)
             b_minus = max(-b_j, 0.0)
 
-            # s_h + h e_j
-            s_plus = tuple(state + h * e_j)
+            # s_h + h e_j -> grid index (grid size h) s_h + e_j
+            s_plus = tuple(state + e_j)
             p_plus = (sigma2 / 2.0 + h * b_plus) / Q
             probs[s_plus] = probs.get(s_plus, 0.0) + p_plus
             total += p_plus
 
             # s_h - h e_j
-            s_minus = tuple(state - h * e_j)
+            s_minus = tuple(state - e_j)
             p_minus = (sigma2 / 2.0 + h * b_minus) / Q
             probs[s_minus] = probs.get(s_minus, 0.0) + p_minus
             total += p_minus
@@ -137,7 +208,7 @@ class PursuitEvasionGame:
         
         # Pursuer reward
         if self.is_crash(evader_pos, game_grid) and not self.is_crash(pursuer_pos, game_grid):
-            return -1
+            return 1
         elif self.is_crash(evader_pos, game_grid) and self.is_crash(pursuer_pos, game_grid):
             return 0
         elif not self.is_crash(evader_pos, game_grid) and self.is_crash(pursuer_pos, game_grid):
@@ -154,20 +225,20 @@ class PursuitEvasionGame:
     
 
     # ================== Terminal States ========================= #
-    def is_crash(self, pos, game_grid: np.ndarray):
+    def is_crash(self, pos_idx, game_grid: np.ndarray):
         """
         Simple crash test:
           - outside grid bounds
           - or cell == 1 (obstacle)
         """
-        x, y = int(round(pos[0])), int(round(pos[1]))
+        x, y = pos_idx[0], pos_idx[1]
         H, W = game_grid.shape
         if x < 0 or x >= W or y < 0 or y >= H:
             return True
         return game_grid[y, x] == 1  # obstacle
 
-    def is_in_region_E(self, pos, game_grid: np.ndarray):
-        x, y = int(round(pos[0])), int(round(pos[1]))
+    def is_in_region_E(self, pos_idx, game_grid: np.ndarray):
+        x, y = pos_idx[0], pos_idx[1]
         H, W = game_grid.shape
         if x < 0 or x >= W or y < 0 or y >= H:
             return False
@@ -206,25 +277,28 @@ class PursuitEvasionGame:
         pursuer_policies = {}
         # 0-level: uniform random over action space
         prob_L0 = 1.0 / len(self.action_space)
-        evader_policies[0] = {a_i: prob_L0 for a_i in range(len(self.action_space))}
-        pursuer_policies[0] = {a_i: prob_L0 for a_i in range(len(self.action_space))}
+        uniform_mu = {
+            s: {a_i: prob_L0 for a_i in range(len(self.action_space))}
+            for s in self.state_space
+        }
+        evader_policies[0] = uniform_mu
+        pursuer_policies[0] = uniform_mu
         # k-level: best response to (k-1)-level opponent
         for k in range(1, max_level+1):
+            print(f"Computing level-{k} policies...")
             # Evader k-level
-            mu_evader_k = self.value_iteration_policy(
+            mu_evader_k, _ = self.value_iteration_policy(
                 opponent_policy=pursuer_policies[k - 1], 
                 opt_type='MIN',
-                grid=grid, 
-                reward_function=reward_function
+                grid=grid
             )
             evader_policies[k] = mu_evader_k
             
             # Pursuer k-level
-            mu_pursuer_k = self.value_iteration_policy(
+            mu_pursuer_k, _ = self.value_iteration_policy(
                 opponent_policy=evader_policies[k - 1], 
                 opt_type='MAX',
-                grid=grid, 
-                reward_function=reward_function
+                grid=grid
             )
             pursuer_policies[k] = mu_pursuer_k
         
@@ -253,20 +327,21 @@ class PursuitEvasionGame:
 
         # Choose extremum type
         if opt_type == "MAX":        # pursuer
-            better = lambda val, best: val > best + 1e-12
+            better = lambda val, best: val > best
             init_best = -float("inf")
         else:                        # evader (MIN)
-            better = lambda val, best: val < best - 1e-12
+            better = lambda val, best: val < best
             init_best = float("inf")
 
         # 2. Value iteration loop over m
         for it in range(max_iter):
+            print(f"  Value iteration it={it+1}...")
             V_old = V.copy()
             delta = 0.0
 
             # Loop over all non-terminal states s ∈ S_h^o
             for s in self.non_terminal_states:
-
+                print(f"    Processing state {s}...")
                 # opponent policy can be state-dependent: π^{-i}(·|s)
                 # if you’re using a single stationary policy, opponent_policy
                 # can itself just be {a_opp_idx: prob}, and you can set:
@@ -278,10 +353,12 @@ class PursuitEvasionGame:
 
                 # Loop over agent's own actions (indexed)
                 for a_i in range(n_actions):
+                    #print(f"      Evaluating action {a_i}...\n")
                     expected_value = 0.0
 
                     # Marginalize over opponent actions θ^{-i}
                     for a_opp_i, p_opp in opp_pi.items():
+                        #print(f"        Opponent action {a_opp_i} with prob {p_opp:.4f}...\n")
                         # Order of actions in the joint action:
                         # MAX (pursuer):   (a_self, a_opp) = (a_p, a_e)
                         # MIN (evader):    (a_self, a_opp) = (a_e, a_p)
@@ -296,13 +373,15 @@ class PursuitEvasionGame:
                         )
 
                         # P_h(s' | s, θ) from your cMDP construction
+                        #print(f"        Computing state transition for joint action {joint_action}...\n")
                         next_state_probs = self.state_transition(
                             s,
                             joint_action,
                             h=1.0,
                             sigma_w=self.sigma_w,
                         )
-
+                        
+                        #print(f"        Next state probabilities: {next_state_probs}\n")
                         # Bellman backup: sum_{s'} P(s'|s,a) V_old(s')
                         for s_next, p_s in next_state_probs.items():
                             expected_value += p_opp * p_s * V_old[s_next]
@@ -337,20 +416,23 @@ class PursuitEvasionGame:
     def step_transition_prob(
         self,
         s, s_next, my_level, opp_level,
-        my_policies, opp_policies,
-        action_space, transition_model):
-        """
-        Compute specific step transition probability:
-          P_h(s_next | s, mu_i^{(my_level)}, mu_-i^{(opp_level)})
-        = sum_{a_i,a_opp} P_h(s_next | s,a_i,a_opp) * mu_i(s,a_i) * mu_opp(s,a_opp)
-        """
-        mu_self = my_policies[my_level][s]     # dict {a: prob}
-        mu_opp  = opp_policies[opp_level][s]   # dict {a: prob}
+        my_policies, opp_policies
+    ):
+        mu_self = my_policies[my_level][s]
+        mu_opp  = opp_policies[opp_level][s]
 
         prob = 0.0
         for a_i, p_i in mu_self.items():
             for a_o, p_o in mu_opp.items():
-                trans = transition_model(s, a_i, a_o)   # dict {s_next: p}
+                joint_action = (
+                    self.action_space[a_i],
+                    self.action_space[a_o]
+                )
+                trans = self.state_transition(
+                    s, joint_action,
+                    h=1.0,
+                    sigma_w=self.sigma_w
+                )
                 prob += p_i * p_o * trans.get(s_next, 0.0)
 
         return prob
@@ -363,9 +445,7 @@ class PursuitEvasionGame:
         candidate_levels,    # iterable of candidate opponent levels, e.g. range(k_max)
         my_policies,
         opp_policies,
-        action_space,
-        transition_model,
-        eps=1e-12,
+        eps=1e-12
     ):
         """
         Implement Eq. (14)-(15): maximum likelihood estimate of opponent level.
@@ -389,8 +469,7 @@ class PursuitEvasionGame:
 
                 p_step = self.step_transition_prob(
                     s, s_next, my_lvl, k_opp,
-                    my_policies, opp_policies,
-                    action_space, transition_model,
+                    my_policies, opp_policies
                 )
                 # accumulate log-likelihood; add eps to avoid log(0)
                 logp += math.log(p_step + eps)
