@@ -3,6 +3,7 @@ import math
 import numpy as np
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
+from matplotlib import animation   # <<< add this
 from functools import lru_cache   # <<< MOD: added for transition caching
 
 # Parameters
@@ -44,7 +45,7 @@ class PursuitEvasionGame:
             dtype=int
         )
 
-        # <<< MOD: precompute R and terminal map as dicts (you already had this)
+        # Boost performance by precomputing reward and terminal maps
         self.R = {
             s: self.reward_function(s, self.grid, self.capture_radius)
             for s in self.state_space
@@ -56,7 +57,6 @@ class PursuitEvasionGame:
         self.non_terminal_states = [
             s for s in self.state_space if not self.is_terminal_map[s]
         ]
-        # <<< END MOD
 
         print(f"Total states: {len(self.state_space)}, Non-terminal states: {len(self.non_terminal_states)}")
 
@@ -198,9 +198,10 @@ class PursuitEvasionGame:
 
     def state_transition(self, state, joint_action, sigma_w):
         state = np.array(state, dtype=int)
-        # TODO: Check this is correct
-        # P_h(s_h'| s_h, theta)
-        # ret: dict mapping s_h' to probability
+        '''
+          P_h(s_h'| s_h, theta)
+          @return: dict mapping s_h' to probability
+        '''
         sigma2 = sigma_w ** 2
         # b_vect represent the drift velocity (agent vel + wind speed)
         b_vec = self.b_vec(state, joint_action, self.wind_map, self.v)  # length 4
@@ -507,7 +508,7 @@ class PursuitEvasionGame:
         eps=1e-12
     ):
         """
-        Implement Eq. (14)-(15): maximum likelihood estimate of opponent level.
+        maximum likelihood estimate of opponent level.
 
         Returns:
           best_level      - argmax_k P(s^{[N-w,N]} | k_i^{[N-w,N]}, k)
@@ -543,12 +544,12 @@ class PursuitEvasionGame:
     # ========= Dynamically adjust the rationality level to countermeasure the opponent ===========
     def choose_next_my_level(self,estimated_opp_level, my_level_max):
         """
-        Implements k_{N+1}^i = min{ \hat{k}_N^{-i} + 1, k_max^i }.
+        k_{N+1}^i = min{ \hat{k}_N^{-i} + 1, k_max^i }.
         """
         return min(estimated_opp_level + 1, my_level_max)
 
 
-    # =================== Debug Helpers ====================== #
+    # =================== Debug & Visualization Helpers ====================== #
     def plot_value_slice_pursuer(self, V_array, evader_pos, title=None, clim=None):
         """
         Plot V(x1, y1, x2*, y2*) as a heatmap over pursuer positions (x1,y1),
@@ -580,13 +581,13 @@ class PursuitEvasionGame:
         plt.colorbar(im, label="Value V(s)")
         plt.title(title or f"Value for pursuer (evader at {evader_pos})")
 
-        # overlay the game grid (obstacles, E region)
+        # Obstacles and Evasion region
         obs_y, obs_x = np.where(self.grid == 1)
         E_y,   E_x   = np.where(self.grid == 2)
         plt.scatter(obs_x, obs_y, marker='s', s=30, c='black', label="Obstacle")
         plt.scatter(E_x, E_y, marker='s', s=30, c='red',   label="Region E")
 
-        # mark evader fixed position
+        # evader
         plt.scatter([x2_fixed], [y2_fixed], c='green', s=80, edgecolor='k', label="Evader fixed")
 
         plt.xlabel("x1 (pursuer)")
@@ -641,4 +642,96 @@ class PursuitEvasionGame:
         plt.gca().set_aspect("equal")
         plt.legend(loc="best")
         plt.tight_layout()
+        plt.show()
+    
+    def animate_trajectory(self, trajectory, title="Pursuit–Evader Animation",
+                           interval=200, save_path=None):
+        """
+        Animate a trajectory:
+          trajectory: list of states [(x1,y1,x2,y2), ...]
+          interval: time between frames in ms
+          save_path: if not None, save as e.g. 'traj.mp4' or 'traj.gif'
+        """
+        H, W = self.grid.shape
+
+        img = np.zeros((H, W, 3), dtype=np.uint8)
+        img[self.grid == 0] = [255, 255, 255]  # free = white
+        img[self.grid == 1] = [0,   0,   0]    # obstacle = black
+        img[self.grid == 2] = [255, 0,   0]    # evader region E = red
+
+        px = [s[0] for s in trajectory]
+        py = [s[1] for s in trajectory]
+        ex = [s[2] for s in trajectory]
+        ey = [s[3] for s in trajectory]
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.imshow(img)
+        ax.set_title(title)
+        ax.invert_yaxis()
+        ax.set_aspect("equal")
+
+        pursuer_path_line, = ax.plot([], [], '-o', color='blue', markersize=3,
+                                     label="Pursuer path")
+        evader_path_line,  = ax.plot([], [], '-o', color='green', markersize=3,
+                                     label="Evader path")
+
+        # Current positions as separate artists
+        pursuer_point, = ax.plot([], [], 'o', markersize=8,
+                                 color='cyan', markeredgecolor='black',
+                                 label="Pursuer")
+        evader_point,  = ax.plot([], [], 'o', markersize=8,
+                                 color='lime', markeredgecolor='black',
+                                 label="Evader")
+
+        ax.legend(loc='lower right')
+
+        def init():
+            pursuer_path_line.set_data([], [])
+            evader_path_line.set_data([], [])
+            pursuer_point.set_data([], [])
+            evader_point.set_data([], [])
+            return pursuer_path_line, evader_path_line, pursuer_point, evader_point
+
+        def update(k):
+            # paths up to step k
+            pursuer_path_line.set_data(px[:k+1], py[:k+1])
+            evader_path_line.set_data(ex[:k+1], ey[:k+1])
+
+            pursuer_point.set_data([px[k]], [py[k]]) 
+            evader_point.set_data([ex[k]], [ey[k]])
+
+            return pursuer_path_line, evader_path_line, pursuer_point, evader_point
+
+        anim = animation.FuncAnimation(
+            fig, update,
+            init_func=init,
+            frames=len(trajectory),
+            interval=interval,
+            blit=True
+        )
+        
+        if save_path is not None:
+            if save_path.lower().endswith('.gif'):
+                writer = 'imagemagick'
+            elif save_path.lower().endswith(('.mp4', '.mov')):
+                writer = 'ffmpeg'
+            else:
+                print(f"Warning: Unknown file extension '{save_path}', defaulting to ffmpeg.")
+                writer = 'ffmpeg'
+            
+            fps = 1000.0 / interval
+            try:
+                anim.save(
+                    save_path, 
+                    writer=writer, 
+                    fps=fps, 
+                    dpi=100 # Lower DPI is usually fine for GIFs
+                )
+                print(f"Animation saved successfully to {save_path} using {writer}.")
+            except Exception as e:
+                print(f"\n--- ERROR SAVING ANIMATION ---")
+                print(f"Failed to save using writer '{writer}'. Check if ImageMagick (for GIF) or ffmpeg (for MP4) is installed and configured in your system PATH.")
+                print(f"Original error: {e}")
+            print(f"Animation saved to {save_path}")
+
         plt.show()
